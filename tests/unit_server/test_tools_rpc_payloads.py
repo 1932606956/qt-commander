@@ -114,9 +114,9 @@ class TestSnapshotPayload:
         assert snap_file.exists()
         assert json.loads(snap_file.read_text()) == {"ok": True}
         assert data["snapshot_id"] == 1
-        assert data["uri"] == (
-            f"qt-commander://sessions/snap_p01/snapshots/snapshot_00000001.json"
-        )
+        # uri is an absolute file:// path to the written snapshot file.
+        assert data["uri"] == snap_file.resolve().as_uri()
+        assert data["uri"].startswith("file://")
 
     @pytest.mark.asyncio
     async def test_snapshot_defaults(self, sm, workspace, server_sessions):

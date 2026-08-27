@@ -230,13 +230,14 @@ async def qt_snapshot(session_id: str, include_hidden: bool = False,
     """Capture the UI element tree of the session's windows.
 
     The tree is NOT in this result — it is written to the file exposed at
-    the returned ``uri`` (resource `qt-commander://sessions/.../snapshots/
-    snapshot_N.json`); read that resource to inspect the tree.  The result
-    carries only session_id / snapshot_id / uri.  Node fields: className,
-    objID, objectName, qml_id (QML ``id`` from the QML source, omitted
-    when empty), rect (window-local logical px), global_rect (screen
-    coords), z_order, visible/enabled/opacity/color_alpha/clip, text,
-    topLevelId, windowTitle, properties (per ``detail``).
+    the returned ``uri``, an absolute ``file://`` path to the written
+    snapshot file (e.g. ``file:///path/.qt-commander/sessions/<sid>/
+    snapshots/snapshot_N.json``); read that file to inspect the tree.  The
+    result carries only session_id / snapshot_id / uri.  Node fields:
+    className, objID, objectName, qml_id (QML ``id`` from the QML source,
+    omitted when empty), rect (window-local logical px), global_rect
+    (screen coords), z_order, visible/enabled/opacity/color_alpha/clip,
+    text, topLevelId, windowTitle, properties (per ``detail``).
 
     ``detail`` — property tier per node: "core" (first-class fields only,
     no properties), "extended" (DEFAULT; common interaction-state
@@ -294,7 +295,7 @@ async def _store_snapshot(session: "Session", result: dict) -> str:
     return _dumps({
         "session_id": session.id,
         "snapshot_id": session.snapshot_count,
-        "uri": f"qt-commander://sessions/{session.id}/snapshots/{filename}",
+        "uri": snap_path.resolve().as_uri(),
     })
 
 
@@ -321,8 +322,9 @@ async def qt_get_snapshot(session_id: str, include_hidden: bool = False,
       - qt_find_element   = never invalidates or renumbers anything
 
     The tree is NOT in this result — it is written to the file at the
-    returned ``uri`` (resource `qt-commander://sessions/.../snapshots/
-    snapshot_N.json`); read that resource to inspect the tree.  The result
+    returned ``uri``, an absolute ``file://`` path to the written snapshot
+    file (e.g. ``file:///path/.qt-commander/sessions/<sid>/snapshots/
+    snapshot_N.json``); read that file to inspect the tree.  The result
     carries only session_id / snapshot_id / uri.  Node fields: className,
     objID, objectName, qml_id (QML ``id`` from the QML source, omitted
     when empty), rect (window-local logical px), global_rect (screen
@@ -372,10 +374,10 @@ async def qt_prune_snapshot(session_id: str, snapshot_id: int) -> str:
     still-visible descendants are reparented up), partially covered ones
     get a ``visible_ratio`` field, fully hidden (opacity 0) elements are
     dropped.  Writes ``snapshot_<id>_pruned.json`` next to the original —
-    read the tree at the returned ``uri`` (same objIDs as the source
-    snapshot plus ``visible_ratio`` annotations).  Result field
-    ``pruned`` = {"removed", "kept", "removed_ratio"}; window roots are
-    never removed.
+    read the tree at the returned ``uri``, an absolute ``file://`` path to
+    the written pruned file (same objIDs as the source snapshot plus
+    ``visible_ratio`` annotations).  Result field ``pruned`` =
+    {"removed", "kept", "removed_ratio"}; window roots are never removed.
 
     The solver is a geometric heuristic (axis-aligned rects, per-window
     z-order with same-z tree order; widgets and QML rectangles/images
@@ -399,7 +401,7 @@ async def qt_prune_snapshot(session_id: str, snapshot_id: int) -> str:
     return _dumps({
         "session_id": session_id,
         "source": f"snapshot_{snapshot_id:08d}.json",
-        "uri": f"qt-commander://sessions/{session_id}/snapshots/{dst.name}",
+        "uri": dst.resolve().as_uri(),
         "pruned": pruned["pruned"],
     })
 
@@ -504,10 +506,11 @@ async def qt_screenshot(session_id: str, element_id: int = 0) -> str:
     """Capture a screenshot of a UI element or the entire window.
 
     ``element_id`` 0 captures the active (or first visible) top-level
-    window.  The PNG is written to the file at the returned ``uri`` —
-    read that resource (qt-commander://sessions/.../screenshots/N.png) to
-    obtain the image bytes.  On failure the result reports the error and
-    no image is written."""
+    window.  The PNG is written to the file at the returned ``uri``, an
+    absolute ``file://`` path to the written PNG (e.g.
+    ``file:///path/.qt-commander/sessions/<sid>/screenshots/N.png``);
+    read that file to obtain the image bytes.  On failure the result
+    reports the error and no image is written."""
     session = _resolve_session(session_id)
     ss_dir = session.session_dir / "screenshots"
     ss_dir.mkdir(parents=True, exist_ok=True)
@@ -546,7 +549,7 @@ async def qt_screenshot(session_id: str, element_id: int = 0) -> str:
 
     return _dumps({
         "session_id": session_id,
-        "uri": f"qt-commander://sessions/{session_id}/screenshots/{filename}",
+        "uri": ss_path.resolve().as_uri(),
     })
 
 

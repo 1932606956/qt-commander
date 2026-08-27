@@ -253,6 +253,7 @@ class TestUiTools:
             "propDepth": 1,
         }
         assert data["session_id"] == "view00000001"
+        assert data["uri"].startswith("file://")
         assert data["uri"].endswith("snapshot_00000001.json")
         snap_file = sess.session_dir / "snapshots" / "snapshot_00000001.json"
         assert snap_file.exists(), "view tree must be written to a file"

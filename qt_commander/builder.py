@@ -16,7 +16,7 @@ class BuildState(Enum):
     BUILT = "built"
 
 
-BUILD_DIR = Path(__file__).resolve().parent.parent / ".qt-commander"
+BUILD_DIR = Path(".qt-commander")
 
 INJECTOR_EXE_NAME = "qt-injector.exe" if os.name == "nt" else "qt-injector"
 LIBRARY_NAME = "libqt-commander.dll" if os.name == "nt" else (

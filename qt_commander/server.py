@@ -28,10 +28,7 @@ from .session import SessionManager
 
 mcp = FastMCP("qt-commander")
 
-_workspace = Path(os.environ.get(
-    "QT_COMMANDER_WORKSPACE",
-    str(Path(__file__).resolve().parent.parent / ".qt-commander"),
-)).resolve()
+_workspace = Path(os.environ.get("QT_COMMANDER_WORKSPACE", ".qt-commander")).resolve()
 _workspace.mkdir(parents=True, exist_ok=True)
 
 sessions = SessionManager(_workspace)

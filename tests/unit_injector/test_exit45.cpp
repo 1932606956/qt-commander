@@ -1,6 +1,17 @@
-// Test exit codes 4 and 5 using --sleep-before-check flag.
-// Exit 4: delete port file during sleep window.
-// Exit 5: modify port file token during sleep window.
+// Port-file tamper resistance AFTER a successful handshake.
+//
+// History: this file used to assert exit codes 4 and 5 ("port file not found",
+// "token mismatch").  Both were produced by main.cpp re-reading the port file
+// AFTER performInitHandshake had already succeeded -- a pure TOCTOU that could
+// only ever turn a good injection into a reported failure.  That re-read is
+// gone: the handshake deletes any stale file before injecting and then polls
+// until it sees *our* token, so nothing downstream may depend on the file
+// again.  Exit 4 and 5 therefore no longer exist (a failed handshake is 3).
+//
+// What is still worth testing is the property the re-read was breaking:
+// tampering with the port file after a successful handshake must NOT be
+// reported as a failure.  The file keeps its historical name so
+// tests/CMakeLists.txt needs no change.
 #define _CRT_SECURE_NO_WARNINGS
 #include <cstdio>
 #include <cstdlib>
@@ -59,24 +70,43 @@ static int run_cov_injector(DWORD pid, const std::string& lib, const std::string
     return (int)ec;
 }
 
-void test_exit_4_delete_port_file() {
+// Launch the widget target, or return 0 when it / the library is unavailable.
+static DWORD launch_target(PROCESS_INFORMATION& pi, std::string& lib) {
     std::string tp = find_binary("qt-widget-test.exe");
-    if (tp.empty()) { printf("SKIP: qt-widget-test.exe not found\n"); return; }
-
-    STARTUPINFOA si = {sizeof(si)}; PROCESS_INFORMATION pi = {};
+    if (tp.empty()) { printf("SKIP: qt-widget-test.exe not found\n"); return 0; }
+    STARTUPINFOA si = {sizeof(si)};
+    pi = PROCESS_INFORMATION{};
     if (!CreateProcessA(nullptr, (LPSTR)tp.c_str(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
-        CHECK(false, "launch Qt test app"); return;
+        CHECK(false, "launch Qt test app"); return 0;
     }
-    DWORD pid = pi.dwProcessId;
     std::this_thread::sleep_for(std::chrono::seconds(2));
+    lib = find_binary("libqt-commander.dll");
+    if (lib.empty()) {
+        printf("SKIP: libqt-commander.dll not found\n");
+        TerminateProcess(pi.hProcess, 0); WaitForSingleObject(pi.hProcess, 5000);
+        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+        pi = PROCESS_INFORMATION{};
+        return 0;
+    }
+    return pi.dwProcessId;
+}
 
-    std::string lib = find_binary("libqt-commander.dll");
-    if (lib.empty()) { printf("SKIP: libqt-commander.dll not found\n"); TerminateProcess(pi.hProcess, 0); WaitForSingleObject(pi.hProcess, 5000); CloseHandle(pi.hProcess); CloseHandle(pi.hThread); return; }
+static void stop_target(PROCESS_INFORMATION& pi) {
+    if (!pi.hProcess) return;
+    TerminateProcess(pi.hProcess, 0); WaitForSingleObject(pi.hProcess, 5000);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    pi = PROCESS_INFORMATION{};
+}
+
+void test_port_file_deleted_after_handshake() {
+    PROCESS_INFORMATION pi{}; std::string lib;
+    DWORD pid = launch_target(pi, lib);
+    if (!pid) return;
 
     std::string pf = std::string(getenv("TEMP") ? getenv("TEMP") : ".") + "\\e2e_exit4.txt";
     DeleteFileA(pf.c_str());
 
-    // Run injector with 3s sleep window
+    // Remove the handshake file while the injector is past its handshake.
     std::thread killer([&pf]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
         DeleteFileA(pf.c_str());
@@ -85,31 +115,23 @@ void test_exit_4_delete_port_file() {
     int ec = run_cov_injector(pid, lib, pf, 3000);
     killer.join();
 
-    printf("Exit code with port file deleted: %d\n", ec);
-    CHECK(ec == 4, (std::string("exit 4 (port file deleted), got ") + std::to_string(ec)).c_str());
+    printf("Exit code with port file deleted after the handshake: %d\n", ec);
+    CHECK(ec == 0, (std::string("injection still succeeds, got ") + std::to_string(ec)).c_str());
 
-    TerminateProcess(pi.hProcess, 0); WaitForSingleObject(pi.hProcess, 5000);
-    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    stop_target(pi);
 }
 
-void test_exit_5_wrong_token() {
-    std::string tp = find_binary("qt-widget-test.exe");
-    if (tp.empty()) { printf("SKIP: qt-widget-test.exe not found\n"); return; }
-
-    STARTUPINFOA si = {sizeof(si)}; PROCESS_INFORMATION pi = {};
-    if (!CreateProcessA(nullptr, (LPSTR)tp.c_str(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
-        CHECK(false, "launch Qt test app"); return;
-    }
-    DWORD pid = pi.dwProcessId;
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-
-    std::string lib = find_binary("libqt-commander.dll");
-    if (lib.empty()) { printf("SKIP: libqt-commander.dll not found\n"); TerminateProcess(pi.hProcess, 0); WaitForSingleObject(pi.hProcess, 5000); CloseHandle(pi.hProcess); CloseHandle(pi.hThread); return; }
+void test_token_overwritten_after_handshake() {
+    PROCESS_INFORMATION pi{}; std::string lib;
+    DWORD pid = launch_target(pi, lib);
+    if (!pid) return;
 
     std::string pf = std::string(getenv("TEMP") ? getenv("TEMP") : ".") + "\\e2e_exit5.txt";
     DeleteFileA(pf.c_str());
 
-    // Run injector with 3s sleep window; during sleep, modify token in port file
+    // Corrupt the token while the injector is past its handshake.  The eject
+    // path resolves the port/token from the handshake result, not from the
+    // file, so this must not change the outcome.
     std::thread modifier([&pf]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
         for (int i = 0; i < 20; i++) {
@@ -133,18 +155,17 @@ void test_exit_5_wrong_token() {
     int ec = run_cov_injector(pid, lib, pf, 3000);
     modifier.join();
 
-    printf("Exit code with wrong token: %d\n", ec);
-    CHECK(ec == 5, (std::string("exit 5 (token mismatch), got ") + std::to_string(ec)).c_str());
+    printf("Exit code with token overwritten after the handshake: %d\n", ec);
+    CHECK(ec == 0, (std::string("injection still succeeds, got ") + std::to_string(ec)).c_str());
 
-    TerminateProcess(pi.hProcess, 0); WaitForSingleObject(pi.hProcess, 5000);
-    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    stop_target(pi);
 }
 
 int main() {
     chdir_to_exe_dir();          // anchor CWD to this exe's build tree
-    printf("=== Exit 4/5 Coverage Tests ===\n\n");
-    test_exit_4_delete_port_file();
-    test_exit_5_wrong_token();
+    printf("=== Port-file tamper resistance tests ===\n\n");
+    test_port_file_deleted_after_handshake();
+    test_token_overwritten_after_handshake();
     printf("\n%d/%d tests passed\n", passed, total);
     return passed == total ? 0 : 1;
 }

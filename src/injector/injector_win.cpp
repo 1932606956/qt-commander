@@ -16,6 +16,7 @@
 #include <chrono>
 #include <thread>
 #include <cstring>
+#include <cctype>
 #include <stdexcept>
 
 // ---------------------------------------------------------------------------

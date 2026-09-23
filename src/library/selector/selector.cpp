@@ -174,6 +174,16 @@ QVector<QObject*> collectRoots(
     // 3. No ancestor / no window -- walk all top-level windows.
     const QList<QWindow*> toplevels = QGuiApplication::topLevelWindows();
     for (QWindow* win : toplevels) {
+        // A window without a platform window has never been realized.
+        // QWindow::winId() calls create() on such a window, forcing a
+        // platform window into existence.  For QQuickWidget's internal
+        // "Offscreen" QQuickWindow that is fatal for the target process:
+        // QQuickWidget requires it to stay non-native, otherwise the next
+        // framebuffer rebuild trips Q_ASSERT(!d->offscreenWindow->handle())
+        // (qquickwidget.cpp:1025) and aborts.  A window that is not
+        // realized is not on screen, so there is nothing to walk into.
+        if (!win->handle())
+            continue;
         // Widget-backed window
         if (QWidget* w = QWidget::find(win->winId())) {
             roots.append(w);

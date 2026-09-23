@@ -124,6 +124,12 @@ QString Screenshot::capture(QObject* target,
         if (win->width() <= 0 || win->height() <= 0)
             return {};
 
+        // Not realized -> nothing on screen to grab, and winId() would
+        // force create() on it (fatal for QQuickWidget's offscreen
+        // window -- see the guard in selector.cpp).
+        if (!win->handle())
+            return {};
+
         QScreen* screen = win->screen();
         if (!screen) {
             // Fallback to primary screen.

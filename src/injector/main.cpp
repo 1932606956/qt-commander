@@ -83,6 +83,13 @@ int main(int argc, char* argv[]) {
     if (!isQtProcess(pid))
         print_error_and_exit(6, "PID " + std::to_string(pid) + " is not a Qt process");
 
+    // Drop any port file left behind by an earlier (possibly killed or timed
+    // out) run before injecting.  The handshake only accepts a file whose
+    // token matches, but a leftover would still be an atomic-rename target
+    // racing with the library's own write.
+    std::error_code removeEc;
+    fs::remove(port_file, removeEc);
+
     InjectResult inject_r = injectLibrary(pid, lib_path);
     if (!inject_r.ok) print_error_and_exit(2, inject_r.error);
 
@@ -91,7 +98,8 @@ int main(int argc, char* argv[]) {
 
     uint16_t port = performInitHandshake(
         pid, lib_path, workspace.string(),
-        port_file.parent_path().filename().string(), token, port_file);
+        port_file.parent_path().filename().string(), token, port_file,
+        inject_r.remote_base);
 
     if (port == 0) print_error_and_exit(3, "qt_commander_init failed or timed out");
 
@@ -101,20 +109,9 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(ms));
     }
 
-    std::ifstream pf(port_file);
-    if (!pf) print_error_and_exit(4, "port file not found: " + port_file.string());
-
-    std::string port_line, token_line;
-    std::getline(pf, port_line);
-    std::getline(pf, token_line);
-    pf.close();
-
-    token_line.erase(0, token_line.find_first_not_of(" \t\r\n"));
-    token_line.erase(token_line.find_last_not_of(" \t\r\n") + 1);
-
-    if (token_line != token)
-        print_error_and_exit(5, "token mismatch in port file");
-
+    // No second read of the port file: the handshake already polled it until
+    // its token equalled ours, so a re-check here could only add a redundant
+    // way to fail (and could not notice a token that changed after that).
     fs::remove(port_file);
 
     std::cout << "{\"port\":" << port << ",\"token\":\"" << token << "\"}\n";

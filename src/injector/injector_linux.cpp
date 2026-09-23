@@ -478,7 +478,12 @@ uint16_t performInitHandshake(int pid, const fs::path& lib_path,
                                const std::string& workspace_path,
                                const std::string& session_id,
                                const std::string& token,
-                               const fs::path& port_file_path) {
+                               const fs::path& port_file_path,
+                               uint64_t remote_module_base) {
+    // The library base comes from the loader maps on this platform; the
+    // handle the Windows injector reports has no ELF equivalent here.
+    (void)remote_module_base;
+
     // 1. Read the .so from disk and find qt_commander_init offset.
     uintptr_t initOffset = findElfExportOffset(lib_path, "qt_commander_init");
     if (initOffset == 0) return 0;

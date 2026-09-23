@@ -26,7 +26,7 @@
 // QMutableEventPoint (private header) is the supported mutation path.
 #include <QtGui/private/qeventpoint_p.h>
 #endif
-#include <QThread>
+#include <QElapsedTimer>
 #include <QPoint>
 #include <QHash>
 
@@ -416,8 +416,40 @@ bool EventInjector::dispatchEvent(QObject* target, QEvent* event)
         const int t = event->type();
         if (t >= QEvent::MouseButtonPress && t <= QEvent::MouseMove) {
             if (auto* iv = qobject_cast<QAbstractItemView*>(w)) {
-                if (QWidget* vp = iv->viewport())
+                if (QWidget* vp = iv->viewport()) {
+                    // The position was computed in *view* coordinates (the
+                    // element centre) and the global position was mapped
+                    // through the view, but the event now goes to the
+                    // viewport, whose origin sits inside the view (below the
+                    // header, inside the frame).  Shifting the position by
+                    // that origin keeps it consistent with the global one --
+                    // otherwise the receiving widget sees a position one
+                    // viewport-origin away from where the click lands, and
+                    // QAbstractItemView::indexAt() (which reads event->pos()
+                    // as viewport coordinates) resolves the wrong row.
+                    auto* me = static_cast<QMouseEvent*>(event);
+                    const QPointF offset(vp->mapTo(iv, QPoint(0, 0)));
+#ifdef QT_COMMANDER_QT6
+                    // Qt6 dropped the QMouseEvent position setters, so the
+                    // corrected event has to be rebuilt instead of adjusted.
+                    auto* shifted = new QMouseEvent(me->type(),
+                                                    me->position() - offset,
+                                                    me->globalPosition(),
+                                                    me->button(), me->buttons(),
+                                                    me->modifiers());
+#else
+                    auto* shifted = new QMouseEvent(me->type(),
+                                                    me->localPos() - offset,
+                                                    me->windowPos() - offset,
+                                                    me->screenPos(),
+                                                    me->button(), me->buttons(),
+                                                    me->modifiers());
+#endif
+                    // The old event was never delivered -- replace it.
+                    delete event;
+                    event = shifted;
                     w = vp;
+                }
             }
         }
         sendToWidget(w, event);
@@ -856,7 +888,16 @@ bool EventInjector::typeText(QObject* target,
 
     const Qt::KeyboardModifiers mods = parseModifiers(modifiers);
 
-    // For typeText we use synchronous dispatch to respect the interval.
+    // Widget and QWindow targets only get their key events *posted* (see the
+    // per-character loop below), so those events arrive when control returns
+    // to the host's event loop: the requested interval therefore has to be
+    // spent pumping that loop, never sleeping on the GUI thread.  Quick items
+    // are dispatched synchronously, so for them the pump only supplies the
+    // pacing delay.
+    // The interval is request-controlled, hence clamped: 200 ms per character
+    // is already slower than human typing, and a larger value would only keep
+    // the host inside this call for text.length() * intervalMs.
+    const int interval = qBound(0, intervalMs, 200);
     // Determine the target type.
     auto* widget = qobject_cast<QWidget*>(target);
 #ifdef QT_COMMANDER_WITH_QML
@@ -915,8 +956,20 @@ bool EventInjector::typeText(QObject* target,
             QCoreApplication::postEvent(win, releaseEvent);
         }
 
-        if (intervalMs > 0)
-            QThread::msleep(intervalMs);
+        if (interval > 0) {
+            // Deliver the key events posted above and let the host keep
+            // running for the rest of the interval.  QThread::msleep() here
+            // froze the GUI thread for text.length() * intervalMs *and* paced
+            // nothing: posted events are only delivered once this lambda
+            // returns to the event loop.
+            QElapsedTimer pump;
+            pump.start();
+            while (pump.elapsed() < interval) {
+                QCoreApplication::processEvents(
+                    QEventLoop::AllEvents,
+                    static_cast<int>(interval - pump.elapsed()));
+            }
+        }
     }
     return true;
 }

@@ -7,6 +7,8 @@
 //   - External lock/unlock for read and write
 //   - Multiple inserts and overwrite semantics
 //   - Clear resets epoch and nextId
+//   - insert() advances nextId and drops displaced reverse entries, so
+//     grow-only inserts never re-issue a live id
 
 #include "element_map.h"
 #include <QObject>
@@ -83,7 +85,7 @@ static void test_epoch()
 }
 
 // ---------------------------------------------------------------------------
-// 5. Next ID returns sequential values (starts at 1, not consumed by insert)
+// 5. Next ID advances past explicitly inserted ids (starts at 1)
 // ---------------------------------------------------------------------------
 static void test_next_id()
 {
@@ -93,15 +95,20 @@ static void test_next_id()
 
     QObject obj1, obj2;
 
-    // insert at explicit id; nextId is unchanged because we didn't use nextId
+    // insert() at an explicit id must leave next_id_ strictly above it.
+    // Leaving it at 1 is the defect: the snapshot handler assigns 1..N from
+    // its own local counter, and the following grow-only insertIfAbsent then
+    // re-issued id 1 and silently overwrote the object that owned it.
     map.insert(10, &obj1);
-    CHECK(map.nextId() == 1, "nextId unchanged after insert with explicit id");
+    CHECK(map.nextId() == 11, "nextId must advance past an explicit id");
 
-    // Insert using nextId directly; nextId is NOT auto-advanced by insert
-    // (the caller is responsible for advancing)
-    map.insert(map.nextId(), &obj2);
-    // nextId still 1 because ElementMap doesn't consume it automatically
-    CHECK(map.nextId() == 1, "nextId remains 1 after insert(map.nextId(), ...)");
+    map.insert(11, &obj2);
+    CHECK(map.nextId() == 12, "nextId must stay above every stored id");
+
+    // A lower explicit id must never move the counter backwards, or an id
+    // that is already mapped could be handed out again.
+    map.insert(3, &obj1);
+    CHECK(map.nextId() == 12, "nextId must never move backwards");
     PASS();
 }
 
@@ -313,6 +320,42 @@ static void test_epoch_monotonic()
 }
 
 // ---------------------------------------------------------------------------
+// 15. Regression: the snapshot sequence (clear + insert 1..N from a local
+// counter) must not let the next grow-only insert re-issue a live id, and
+// overwriting an id must drop the displaced object's reverse entry
+// ---------------------------------------------------------------------------
+static void test_insert_advances_next_id()
+{
+    TEST("grow-only insert after explicit inserts cannot reuse a live id");
+    ElementMap map;
+    const int kCount = 4;
+    QObject objs[kCount];
+
+    map.clear();
+    for (int i = 0; i < kCount; ++i)
+        map.insert(static_cast<uint64_t>(i + 1), &objs[i]);
+
+    QObject fresh;
+    const uint64_t freshId = map.insertIfAbsent(&fresh);
+    CHECK(freshId == static_cast<uint64_t>(kCount) + 1,
+          "grow-only insert must allocate an id past the explicit ones");
+    CHECK(map.lookup(freshId) == &fresh, "the new id must map the new object");
+
+    // Nothing that was explicitly inserted may have been overwritten.
+    for (int i = 0; i < kCount; ++i) {
+        CHECK(map.lookup(static_cast<uint64_t>(i + 1)) == &objs[i],
+              "an explicit insert was overwritten by the grow-only insert");
+    }
+
+    // Overwriting id 2 with a different object displaces objs[1], whose
+    // reverse entry must be dropped so it gets a fresh id from now on.
+    map.insert(2, &fresh);
+    CHECK(map.idFor(&objs[1]) == 0, "the displaced object must lose its id");
+    CHECK(map.idFor(&fresh) == 2, "the overwriting object must own the id");
+    PASS();
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main()
@@ -336,6 +379,7 @@ int main()
     test_epoch_monotonic();
     test_snapshot();
     test_rwlock_accessor();
+    test_insert_advances_next_id();
 
     std::cout << "\n" << passed << " passed, " << failed << " failed\n";
     return failed > 0 ? 1 : 0;

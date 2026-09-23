@@ -11,6 +11,7 @@
 #include <vector>
 #include <string>
 #include <set>
+#include <cstdio>
 #include <fstream>
 #include <algorithm>
 #include <chrono>
@@ -22,6 +23,14 @@
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+// Grace period granted to a remote thread that overran its wait before the
+// injector gives up on it.  Remote threads are never terminated: the routines
+// they run (LoadLibraryW, qt_commander_init, FreeLibrary) take the process
+// loader lock, and TerminateThread does not release a critical section owned
+// by the dying thread -- the lock would stay held forever and every later
+// loader operation in the host process would block.
+static const DWORD kExitGraceMs = 2000;
 
 static std::string lastErrorString() {
     DWORD err = GetLastError();
@@ -291,8 +300,16 @@ static_assert(sizeof(InitParams) == 1024, "InitParams size must be 1024 bytes");
 
 // ---------------------------------------------------------------------------
 // injectDll  --  load a single DLL into the target via CreateRemoteThread
+//
+// Reports the module base the target's loader returned (via *outBase).
+// Callers that must call into the injected module need that base: deriving it
+// by matching the module NAME can pick a different, already-loaded module.
 // ---------------------------------------------------------------------------
-static InjectResult injectDll(int pid, const fs::path& dllPath) {
+static InjectResult injectDll(int pid, const fs::path& dllPath,
+                              HMODULE* outBase = nullptr) {
+    if (outBase)
+        *outBase = nullptr;
+
     // 1. Open target process with minimal required rights
     HANDLE hProcess = OpenProcess(
         PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE |
@@ -352,16 +369,26 @@ static InjectResult injectDll(int pid, const fs::path& dllPath) {
         return {false, "CreateRemoteThread failed: " + lastErrorString()};
     }
 
-    // 7. Wait for thread to finish
+    // 7. Wait for thread to finish.  On timeout, grant one short grace period
+    //    instead of calling TerminateThread: the remote routine is
+    //    LoadLibraryW, which holds the process loader lock for its whole
+    //    duration, and a terminated thread never releases a lock it owns --
+    //    every later loader operation in the target would block forever.
     DWORD waitResult = WaitForSingleObject(hThread, 30000);
     if (waitResult == WAIT_TIMEOUT) {
-        TerminateThread(hThread, 1);
-        CloseHandle(hThread);
-        VirtualFreeEx(hProcess, remotePath, 0, MEM_RELEASE);
-        CloseHandle(hProcess);
-        return {false, "remote thread timed out (30 s)"};
-    }
-    if (waitResult == WAIT_FAILED) {
+        waitResult = WaitForSingleObject(hThread, kExitGraceMs);
+        if (waitResult != WAIT_OBJECT_0) {
+            // Still inside LoadLibraryW, which may be reading the path right
+            // now: the remote allocation is deliberately leaked (the target
+            // reclaims it at process exit) rather than freed under a live
+            // thread, which would be a use-after-free.
+            CloseHandle(hThread);
+            CloseHandle(hProcess);
+            return {false, "remote LoadLibraryW is still running after 30 s + "
+                           "grace; the load may still complete -- do not "
+                           "retry blindly"};
+        }
+    } else if (waitResult == WAIT_FAILED) {
         CloseHandle(hThread);
         VirtualFreeEx(hProcess, remotePath, 0, MEM_RELEASE);
         CloseHandle(hProcess);
@@ -377,10 +404,48 @@ static InjectResult injectDll(int pid, const fs::path& dllPath) {
         return {false, "LoadLibraryW returned NULL in target process"};
     }
 
-    // 9. Clean up
+    // 9. Resolve the FULL 64-bit base while the process handles are open.
+    //    LoadLibraryW's HMODULE comes back through the thread exit code, and
+    //    that is a DWORD: a 64-bit target maps DLLs above 4 GB (typically
+    //    0x7FF...), so the exit code keeps only the low 32 bits and must never
+    //    be used as an address.  Those bits still identify the module exactly,
+    //    so find the module that carries them and report its real address.
+    //    A second, read-only handle is used because EnumProcessModules needs
+    //    PROCESS_VM_READ, which the injection handle deliberately omits.
+    HMODULE fullBase = nullptr;
+    if (outBase) {
+        HANDLE hQuery = OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE,
+            static_cast<DWORD>(pid));
+        if (hQuery) {
+            DWORD needed = 0;
+            EnumProcessModules(hQuery, nullptr, 0, &needed);
+            std::vector<HMODULE> modules(needed / sizeof(HMODULE));
+            if (EnumProcessModules(
+                    hQuery, modules.data(),
+                    static_cast<DWORD>(modules.size() * sizeof(HMODULE)),
+                    &needed)) {
+                for (HMODULE hMod : modules) {
+                    if ((reinterpret_cast<uintptr_t>(hMod) & 0xFFFFFFFFu) ==
+                        static_cast<uintptr_t>(exitCode)) {
+                        fullBase = hMod;
+                        break;
+                    }
+                }
+            }
+            CloseHandle(hQuery);
+        }
+    }
+
+    // 10. Clean up
     CloseHandle(hThread);
     VirtualFreeEx(hProcess, remotePath, 0, MEM_RELEASE);
     CloseHandle(hProcess);
+
+    // Unknown base stays null: the caller falls back to its own lookup rather
+    // than being handed a truncated address.
+    if (outBase)
+        *outBase = fullBase;
 
     return {true, ""};
 }
@@ -489,7 +554,13 @@ InjectResult injectLibrary(int pid, const fs::path& lib_path) {
     if (!preloadDepsRecursive(pid, absLib, {absLib.parent_path()},
                               loaded, handled, err))
         return {false, err};
-    return injectDll(pid, absLib);
+
+    // Report the main library's own base: the init handshake must compute the
+    // exported entry point from the image the target actually loaded.
+    HMODULE libBase = nullptr;
+    InjectResult r = injectDll(pid, absLib, &libBase);
+    r.remote_base = reinterpret_cast<uint64_t>(libBase);
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -499,7 +570,8 @@ uint16_t performInitHandshake(int pid, const fs::path& lib_path,
                               const std::string& workspace_path,
                               const std::string& session_id,
                               const std::string& token,
-                              const fs::path& port_file_path) {
+                              const fs::path& port_file_path,
+                              uint64_t remote_module_base) {
     // 1. Read DLL from disk and find the RVA of qt_commander_init
     std::vector<uint8_t> dllBytes;
     if (!readFileBytes(lib_path, dllBytes)) {
@@ -520,34 +592,43 @@ uint16_t performInitHandshake(int pid, const fs::path& lib_path,
         return 0;
     }
 
-    // 3. Lookup DLL base via module enumeration
-    std::wstring libNameW = lib_path.filename().wstring();
-    HMODULE dllBase = nullptr;
-
-    DWORD needed = 0;
-    EnumProcessModules(hProcess, nullptr, 0, &needed);
-    std::vector<HMODULE> modules(needed / sizeof(HMODULE));
-    if (!EnumProcessModules(
-            hProcess, modules.data(),
-            static_cast<DWORD>(modules.size() * sizeof(HMODULE)),
-            &needed)) {
-        CloseHandle(hProcess);
-        return 0;
-    }
-
-    for (const auto& hMod : modules) {
-        wchar_t modName[MAX_PATH]{};
-        if (GetModuleBaseNameW(hProcess, hMod, modName, MAX_PATH) == 0)
-            continue;
-        if (_wcsicmp(modName, libNameW.c_str()) == 0) {
-            dllBase = hMod;
-            break;
-        }
-    }
-
+    // 3. Determine the module base the entry-point RVA is relative to.
+    //    Preferred: the base of the image LoadLibraryW mapped inside the
+    //    target (reported by injectDll).  Fallback only when the caller has no
+    //    base: match the base name against the target's module list.  Windows
+    //    hands back the already-loaded module for any same-base-name match,
+    //    so the name lookup can silently pick a different image, and the RVA
+    //    would then be applied to the wrong base.
+    HMODULE dllBase = reinterpret_cast<HMODULE>(
+        static_cast<uintptr_t>(remote_module_base));
     if (!dllBase) {
-        CloseHandle(hProcess);
-        return 0;
+        std::wstring libNameW = lib_path.filename().wstring();
+
+        DWORD needed = 0;
+        EnumProcessModules(hProcess, nullptr, 0, &needed);
+        std::vector<HMODULE> modules(needed / sizeof(HMODULE));
+        if (!EnumProcessModules(
+                hProcess, modules.data(),
+                static_cast<DWORD>(modules.size() * sizeof(HMODULE)),
+                &needed)) {
+            CloseHandle(hProcess);
+            return 0;
+        }
+
+        for (const auto& hMod : modules) {
+            wchar_t modName[MAX_PATH]{};
+            if (GetModuleBaseNameW(hProcess, hMod, modName, MAX_PATH) == 0)
+                continue;
+            if (_wcsicmp(modName, libNameW.c_str()) == 0) {
+                dllBase = hMod;
+                break;
+            }
+        }
+
+        if (!dllBase) {
+            CloseHandle(hProcess);
+            return 0;
+        }
     }
 
     // 4. Compute entry-point address in the target
@@ -601,15 +682,25 @@ uint16_t performInitHandshake(int pid, const fs::path& lib_path,
         return 0;
     }
 
-    // 9. Wait for init call to finish (it should copy the params and return
-    //    quickly)
+    // 9. Wait for the init call to finish (it copies the params and returns
+    //    quickly).  On timeout, grant one short grace period instead of
+    //    terminating the thread: qt_commander_init starts the RPC thread and
+    //    touches the loader, and a thread killed inside the loader leaves the
+    //    process loader lock held forever.
     DWORD waitResult = WaitForSingleObject(hThread, 10000);
+    if (waitResult == WAIT_TIMEOUT)
+        waitResult = WaitForSingleObject(hThread, kExitGraceMs);
     if (waitResult != WAIT_OBJECT_0) {
-        // Init timed out or failed -- clean up and return.
-        TerminateThread(hThread, 1);
+        // Still running (or unqueryable): it may still be reading the params
+        // it was handed, so that allocation is deliberately leaked -- the
+        // target reclaims it at process exit -- instead of being freed under
+        // a live thread.
         CloseHandle(hThread);
-        VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE);
         CloseHandle(hProcess);
+        std::fprintf(stderr,
+                     "[initHandshake] qt_commander_init is still running after "
+                     "10 s + grace; the injection may yet complete -- do not "
+                     "retry blindly\n");
         return 0;
     }
     CloseHandle(hThread);
@@ -618,10 +709,14 @@ uint16_t performInitHandshake(int pid, const fs::path& lib_path,
     VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE);
     CloseHandle(hProcess);
 
-    // 11. Poll the port file with exponential backoff
+    // 11. Poll the port file with exponential backoff until it carries OUR
+    //     token.  A file left behind by a killed or timed-out run parses
+    //     perfectly well, so breaking on the first parseable file made every
+    //     later injection into that PID fail on the token comparison that
+    //     used to happen afterwards.  Unreadable, partial and foreign files
+    //     are simply "not ours yet" and keep the loop going.
     int delayMs = 50;
     uint16_t port = 0;
-    std::string fileToken;
 
     for (int attempt = 0; attempt < 10; ++attempt) {
         if (attempt > 0) {
@@ -635,33 +730,161 @@ uint16_t performInitHandshake(int pid, const fs::path& lib_path,
             continue;
 
         std::string line;
-        if (std::getline(inFile, line)) {
-            try {
-                port = static_cast<uint16_t>(std::stoi(line));
-            } catch (...) {
-                port = 0;
-                continue;
-            }
-        }
+        if (!std::getline(inFile, line))
+            continue;
 
-        if (std::getline(inFile, fileToken)) {
-            // Trim whitespace
-            auto trim = [](std::string& s) {
-                s.erase(0, s.find_first_not_of(" \t\r\n"));
-                s.erase(s.find_last_not_of(" \t\r\n") + 1);
-            };
-            trim(fileToken);
+        uint16_t candidate = 0;
+        try {
+            candidate = static_cast<uint16_t>(std::stoi(line));
+        } catch (...) {
+            continue;  // not a port line we can use
         }
+        if (candidate == 0)
+            continue;
 
-        if (port > 0 && !fileToken.empty())
-            break;
+        std::string fileToken;
+        if (!std::getline(inFile, fileToken))
+            continue;
+
+        // Trim whitespace
+        auto trim = [](std::string& s) {
+            s.erase(0, s.find_first_not_of(" \t\r\n"));
+            s.erase(s.find_last_not_of(" \t\r\n") + 1);
+        };
+        trim(fileToken);
+
+        if (fileToken != token)
+            continue;  // foreign or half-written file -- keep polling
+
+        port = candidate;
+        break;
     }
 
-    // 12. Verify token
-    if (port == 0 || fileToken != token)
+    return port;
+}
+
+// ---------------------------------------------------------------------------
+// Remote-image helpers (eject path)
+// ---------------------------------------------------------------------------
+
+// Read `size` bytes from the target.  False on a short or unreadable read.
+static bool readRemoteBytes(HANDLE hProcess, uintptr_t addr, void* buf,
+                            size_t size) {
+    SIZE_T got = 0;
+    return ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(addr), buf,
+                             size, &got) != 0 && got == size;
+}
+
+// Resolve an exported function inside the module AS LOADED IN THE TARGET.
+// Returns 0 when the loaded image does not export the name or its headers
+// cannot be read.
+//
+// The address must not be derived from the file on disk: the eject path jumps
+// straight to whatever this returns, so an RVA taken from a rebuilt (or just
+// older) file would be a call to an arbitrary address inside the host process.
+static uintptr_t findRemoteExport(HANDLE hProcess, HMODULE base,
+                                  const char* name) {
+    const uintptr_t modBase = reinterpret_cast<uintptr_t>(base);
+
+    IMAGE_DOS_HEADER dos{};
+    if (!readRemoteBytes(hProcess, modBase, &dos, sizeof(dos)) ||
+        dos.e_magic != IMAGE_DOS_SIGNATURE)
         return 0;
 
-    return port;
+    // Read the NT headers as raw bytes and locate the export directory from
+    // the optional-header magic: PE32 and PE32+ place DataDirectory at
+    // different offsets, and a 64-bit injector may be looking at a 32-bit
+    // (WOW64) target.
+    uint8_t nt[sizeof(IMAGE_NT_HEADERS)]{};
+    if (!readRemoteBytes(hProcess, modBase + static_cast<DWORD>(dos.e_lfanew),
+                         nt, sizeof(nt)))
+        return 0;
+
+    DWORD signature = 0;
+    memcpy(&signature, nt, sizeof(signature));
+    if (signature != IMAGE_NT_SIGNATURE)
+        return 0;
+
+    WORD magic = 0;
+    memcpy(&magic, nt + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER),
+           sizeof(magic));
+    const size_t ddOffset =
+        sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) +
+        (magic == 0x20B ? 112 : 96) +
+        IMAGE_DIRECTORY_ENTRY_EXPORT * sizeof(IMAGE_DATA_DIRECTORY);
+    if (ddOffset + sizeof(IMAGE_DATA_DIRECTORY) > sizeof(nt))
+        return 0;
+
+    DWORD expRva = 0;
+    DWORD expSize = 0;
+    memcpy(&expRva, nt + ddOffset, sizeof(expRva));
+    memcpy(&expSize, nt + ddOffset + sizeof(expRva), sizeof(expSize));
+    if (expRva == 0 || expSize == 0)
+        return 0;
+
+    IMAGE_EXPORT_DIRECTORY exp{};
+    if (!readRemoteBytes(hProcess, modBase + expRva, &exp, sizeof(exp)))
+        return 0;
+
+    for (DWORD i = 0; i < exp.NumberOfNames; ++i) {
+        DWORD nameRva = 0;
+        if (!readRemoteBytes(hProcess, modBase + exp.AddressOfNames + i * 4,
+                             &nameRva, sizeof(nameRva)))
+            return 0;
+
+        char remoteName[64]{};
+        if (!readRemoteBytes(hProcess, modBase + nameRva, remoteName,
+                             sizeof(remoteName) - 1))
+            continue;
+        if (strcmp(remoteName, name) != 0)
+            continue;
+
+        WORD ordinal = 0;
+        if (!readRemoteBytes(hProcess,
+                             modBase + exp.AddressOfNameOrdinals + i * 2,
+                             &ordinal, sizeof(ordinal)))
+            return 0;
+
+        DWORD funcRva = 0;
+        if (!readRemoteBytes(hProcess,
+                             modBase + exp.AddressOfFunctions +
+                                 static_cast<DWORD>(ordinal) * 4,
+                             &funcRva, sizeof(funcRva)))
+            return 0;
+
+        // A forwarded export holds a name string inside the export directory
+        // instead of code -- there is nothing callable here.
+        if (funcRva >= expRva && funcRva < expRva + expSize)
+            return 0;
+
+        return modBase + funcRva;
+    }
+
+    return 0;
+}
+
+// Call a parameter-less routine in the target and wait for it.  False means
+// the call could not be started or did not finish in time -- the caller must
+// not assume the routine did nothing.
+static bool callRemoteNoArg(HANDLE hProcess, uintptr_t addr, DWORD timeoutMs,
+                            DWORD& exitCode) {
+    HANDLE hThread = CreateRemoteThread(
+        hProcess, nullptr, 0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(addr), nullptr, 0, nullptr);
+    if (!hThread)
+        return false;
+
+    // Never TerminateThread: the routine may hold a lock (loader or the
+    // library's session mutex) that the target process still needs.
+    const DWORD waitResult = WaitForSingleObject(hThread, timeoutMs);
+    if (waitResult != WAIT_OBJECT_0) {
+        CloseHandle(hThread);
+        return false;
+    }
+
+    const bool ok = GetExitCodeThread(hThread, &exitCode) != 0;
+    CloseHandle(hThread);
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -676,9 +899,84 @@ InjectResult ejectLibrary(int pid, const fs::path& lib_path) {
         return {false, "ejectLibrary: OpenProcess failed: " + lastErrorString()};
     }
 
-    // The library may have been LoadLibrary'd more than once (each attach
-    // adds a reference), so loop: keep calling FreeLibrary until the
-    // module is gone from the target (or the cap is reached).
+    const std::wstring libNameW = lib_path.filename().wstring();
+    auto findModule = [&](HMODULE& out) {
+        DWORD needed = 0;
+        EnumProcessModules(hProcess, nullptr, 0, &needed);
+        std::vector<HMODULE> modules(needed / sizeof(HMODULE));
+        if (!EnumProcessModules(hProcess, modules.data(),
+                                static_cast<DWORD>(
+                                    modules.size() * sizeof(HMODULE)),
+                                &needed))
+            return false;
+
+        out = nullptr;
+        for (const auto& hMod : modules) {
+            wchar_t modName[MAX_PATH]{};
+            if (GetModuleBaseNameW(hProcess, hMod, modName, MAX_PATH) &&
+                _wcsicmp(modName, libNameW.c_str()) == 0) {
+                out = hMod;
+                break;
+            }
+        }
+        return true;
+    };
+
+    // 1. Resolve the module in the target.
+    HMODULE dllBase = nullptr;
+    if (!findModule(dllBase)) {
+        CloseHandle(hProcess);
+        return {false, "ejectLibrary: EnumProcessModules failed: " +
+                           lastErrorString()};
+    }
+    if (!dllBase) {
+        CloseHandle(hProcess);
+        return {true, ""};  // never loaded (or already unloaded)
+    }
+
+    // 2. Ask the library to end its session.  FreeLibrary alone would drop the
+    //    reference count while the RPC thread is still blocked inside the
+    //    module; the library pins itself for that thread's lifetime, so the
+    //    unload would silently not happen and this command would report
+    //    success for an eject that never took effect.
+    const uintptr_t shutdownFn =
+        findRemoteExport(hProcess, dllBase, "qt_commander_request_shutdown");
+    if (shutdownFn) {
+        DWORD ignored = 0;
+        callRemoteNoArg(hProcess, shutdownFn, 2000, ignored);
+    }
+
+    // 3. Wait (bounded) for the session slot to be released.  Poll the state
+    //    instead of guessing a fixed delay: the RPC thread only clears it
+    //    after its accept loop and connection teardown have finished.
+    const uintptr_t stateFn =
+        findRemoteExport(hProcess, dllBase, "qt_commander_session_state");
+    if (stateFn) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(3000);
+        bool active = true;  // "unknown" counts as active: never unload blind
+        while (true) {
+            DWORD state = 0;
+            if (callRemoteNoArg(hProcess, stateFn, 1000, state)) {
+                active = (state != 0);
+                if (!active)
+                    break;
+            }
+            if (std::chrono::steady_clock::now() >= deadline)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (active) {
+            CloseHandle(hProcess);
+            return {false, "refusing to unload: a library session is still "
+                           "active (reconnect and shut down the client first)"};
+        }
+    }
+
+    // 4. Unload: exactly ONE FreeLibrary for the one reference this injector
+    //    added with LoadLibraryW.  The old loop kept calling FreeLibrary until
+    //    the module disappeared, which necessarily dropped references the
+    //    injector never held -- it could unload a module the host still uses.
     FARPROC freeLibAddr = GetProcAddress(
         GetModuleHandleW(L"kernel32"), "FreeLibrary");
     if (!freeLibAddr) {
@@ -686,65 +984,55 @@ InjectResult ejectLibrary(int pid, const fs::path& lib_path) {
         return {false, "ejectLibrary: GetProcAddress(FreeLibrary) failed"};
     }
 
-    const std::wstring libNameW = lib_path.filename().wstring();
-    for (int attempt = 0; attempt < 10; ++attempt) {
-        // Enumerate modules to find the DLL base
-        DWORD needed = 0;
-        EnumProcessModules(hProcess, nullptr, 0, &needed);
-        std::vector<HMODULE> modules(needed / sizeof(HMODULE));
-        if (!EnumProcessModules(hProcess, modules.data(),
-                                static_cast<DWORD>(
-                                    modules.size() * sizeof(HMODULE)),
-                                &needed)) {
-            CloseHandle(hProcess);
-            return {false, "ejectLibrary: EnumProcessModules failed: " +
-                               lastErrorString()};
-        }
-
-        HMODULE dllBase = nullptr;
-        for (const auto& hMod : modules) {
-            wchar_t modName[MAX_PATH]{};
-            if (GetModuleBaseNameW(hProcess, hMod, modName, MAX_PATH) &&
-                _wcsicmp(modName, libNameW.c_str()) == 0) {
-                dllBase = hMod;
-                break;
-            }
-        }
-        if (!dllBase)
-            break;  // already fully unloaded -> success
-
-        // Call FreeLibrary in the target
-        HANDLE hThread = CreateRemoteThread(
-            hProcess, nullptr, 0,
-            reinterpret_cast<LPTHREAD_START_ROUTINE>(freeLibAddr),
-            dllBase, 0, nullptr);
-        if (!hThread) {
-            CloseHandle(hProcess);
-            return {false, "ejectLibrary: CreateRemoteThread failed: " +
-                               lastErrorString()};
-        }
-
-        DWORD waitResult = WaitForSingleObject(hThread, 15000);
-        if (waitResult != WAIT_OBJECT_0) {
-            TerminateThread(hThread, 1);
-            CloseHandle(hThread);
-            CloseHandle(hProcess);
-            return {false, "ejectLibrary: remote thread timed out (15s)"};
-        }
-
-        // FreeLibrary returns nonzero on success; zero means the
-        // reference count did not drop (e.g. a bad handle).
-        DWORD exitCode = 0;
-        if (!GetExitCodeThread(hThread, &exitCode) || exitCode == 0) {
-            CloseHandle(hThread);
-            CloseHandle(hProcess);
-            return {false, "ejectLibrary: FreeLibrary returned FALSE "
-                           "in target process"};
-        }
-        CloseHandle(hThread);
+    HANDLE hThread = CreateRemoteThread(
+        hProcess, nullptr, 0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(freeLibAddr),
+        dllBase, 0, nullptr);
+    if (!hThread) {
+        CloseHandle(hProcess);
+        return {false, "ejectLibrary: CreateRemoteThread failed: " +
+                           lastErrorString()};
     }
 
+    DWORD waitResult = WaitForSingleObject(hThread, 15000);
+    if (waitResult == WAIT_TIMEOUT)
+        waitResult = WaitForSingleObject(hThread, kExitGraceMs);
+    if (waitResult != WAIT_OBJECT_0) {
+        // FreeLibrary never takes the loader lock for long, but a thread
+        // killed inside the loader would leave that lock held forever.
+        CloseHandle(hThread);
+        CloseHandle(hProcess);
+        return {false, "ejectLibrary: remote FreeLibrary is still running "
+                       "after 15 s + grace; the unload may still complete -- "
+                       "do not retry blindly"};
+    }
+
+    // FreeLibrary returns nonzero on success; zero means the reference count
+    // did not drop (e.g. a bad handle).
+    DWORD exitCode = 0;
+    if (!GetExitCodeThread(hThread, &exitCode) || exitCode == 0) {
+        CloseHandle(hThread);
+        CloseHandle(hProcess);
+        return {false, "ejectLibrary: FreeLibrary returned FALSE "
+                       "in target process"};
+    }
+    CloseHandle(hThread);
+
+    // 5. Report honestly: the module is only really gone if it is no longer in
+    //    the target's module list.  FreeLibrary can succeed while another
+    //    reference (a pin, or the host's own LoadLibrary) keeps it mapped.
+    HMODULE after = nullptr;
+    if (!findModule(after)) {
+        CloseHandle(hProcess);
+        return {false, "ejectLibrary: EnumProcessModules failed: " +
+                           lastErrorString()};
+    }
     CloseHandle(hProcess);
+
+    if (after) {
+        return {false, "ejectLibrary: module still loaded after FreeLibrary "
+                       "(reference held elsewhere)"};
+    }
     return {true, ""};
 }
 

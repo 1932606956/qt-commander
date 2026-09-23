@@ -34,8 +34,9 @@ namespace {
 // QJsonValue::toVariant() may produce int, double, or qint64 for numeric
 // JSON values depending on the Qt version.  QObject::property() returns
 // the native type (int, uint, qlonglong, double, etc.).  We attempt
-// integer comparison first, then floating-point, then fall through to
-// QVariant::operator== for exact-type matches.
+// floating-point comparison first whenever either value is a floating type
+// (see the precedence note below), then integer comparison, then fall
+// through to QVariant::operator== for exact-type matches.
 // -----------------------------------------------------------------------
 bool variantsEqual(const QVariant& lhs, const QVariant& rhs)
 {
@@ -45,8 +46,22 @@ bool variantsEqual(const QVariant& lhs, const QVariant& rhs)
     if (!lhs.isValid() && !rhs.isValid()) return true;
     if (!lhs.isValid() || !rhs.isValid()) return false;
 
+    // --- float / integral precedence -----------------------------------------
+    // Qt 5's QVariant::toLongLong() succeeds on a double by TRUNCATING it, so
+    // if the integral branch ran first, 0.5 and 0.9 would both truncate to 0
+    // and compare equal, leaving the qFuzzyCompare branch below unreachable
+    // for ordinary doubles (the properties filter {"opacity": 0.5} then
+    // matched an element whose opacity was 0.9).  The floating-point
+    // comparison must therefore win whenever a float is actually involved;
+    // integrally-typed values still take the integral branches below, so a
+    // float property 0.5 does not match an integral filter value such as 1.
+    const bool compareAsFloat = lhs.userType() == QMetaType::Double ||
+                                lhs.userType() == QMetaType::Float ||
+                                rhs.userType() == QMetaType::Double ||
+                                rhs.userType() == QMetaType::Float;
+
     // --- integral comparison -------------------------------------------------
-    {
+    if (!compareAsFloat) {
         bool lhsOk = false, rhsOk = false;
         const qlonglong lhsInt = lhs.toLongLong(&lhsOk);
         const qlonglong rhsInt = rhs.toLongLong(&rhsOk);
@@ -56,7 +71,7 @@ bool variantsEqual(const QVariant& lhs, const QVariant& rhs)
     }
 
     // --- unsigned integral comparison (avoid sign-extension issues) ----------
-    {
+    if (!compareAsFloat) {
         bool lhsOk = false, rhsOk = false;
         const qulonglong lhsUint = lhs.toULongLong(&lhsOk);
         const qulonglong rhsUint = rhs.toULongLong(&rhsOk);

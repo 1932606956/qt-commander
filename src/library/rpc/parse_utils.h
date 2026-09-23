@@ -1,5 +1,6 @@
 #pragma once
 #include <QJsonObject>
+#include <cmath>
 #include <cstdint>
 
 /// Parse element ID from JSON params.
@@ -15,7 +16,16 @@ inline bool qt_parse_element_id(const QJsonObject& params, uint64_t& outId) {
     if (val.isUndefined())
         return false;
     if (val.isDouble()) {
-        outId = static_cast<uint64_t>(val.toDouble());
+        // JSON numbers arrive as double: casting a negative, NaN, non-integral
+        // or out-of-range value to uint64_t is undefined behaviour and could
+        // yield a huge id that is then treated as valid.  Values above 2^53 are
+        // rejected because integers are no longer exactly representable there.
+        const double idNum = val.toDouble();
+        if (!std::isfinite(idNum) || idNum < 0.0 ||
+            idNum > 9007199254740992.0 || std::floor(idNum) != idNum) {
+            return false;   // invalid input: report "no id" like a missing param
+        }
+        outId = static_cast<uint64_t>(idNum);
         return outId > 0;
     }
     const QString idStr = val.toString();

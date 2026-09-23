@@ -804,11 +804,24 @@ void run_rpc_server(socket_t listen_fd,
 {
     ensureMetaTypes();
 
-    // ---- Accept one connection ------------------------------------------
-    socket_t client_fd = tcp_accept(listen_fd);
+    // ---- Accept one connection (bounded wait) ---------------------------
+    // A blocking accept() parks this worker thread forever when nobody
+    // connects: the session slot is then never released (entry_win.cpp keeps
+    // returning -1 for this PID) and the shutdown flag is never observed.
+    // A short SO_RCVTIMEO turns tcp_accept() into a select()-bounded poll,
+    // so the loop can honour the flag between attempts.  The timeout is set
+    // on the LISTENER only -- the accepted socket gets its own timeouts
+    // further down.
+    tcp_set_recv_timeout(listen_fd, 250);
+    socket_t client_fd = INVALID_SOCK;
+    while (!shutdown_flag.load()) {
+        client_fd = tcp_accept(listen_fd);
+        if (client_fd != INVALID_SOCK)
+            break;  // connected; a timeout just re-checks the flag
+    }
     tcp_close(listen_fd);                 // no longer needed
     if (client_fd == INVALID_SOCK)
-        return;
+        return;  // shutdown requested -- give up and release the slot
     if (shutdown_flag.load()) {
         tcp_close(client_fd);
         return;
@@ -927,6 +940,18 @@ void run_rpc_server(socket_t listen_fd,
             [elementMap, state, opMethod, rpcParams, elementId,
              rpcId, isNotification]() {
                 // ---- Runs on the MAIN thread ----------------------------
+                // This lambda is invoked from Qt's event loop, so nothing may
+                // escape it as an exception: an uncaught throw (e.g.
+                // std::bad_alloc while building a large snapshot/property
+                // payload) would unwind into the host's main() and call
+                // std::terminate.  semReleased makes the exactly-once release
+                // of the waiting worker explicit: the body sets it before
+                // each of its own releases, so the catch handler only
+                // releases on a path where the body did not.  The body keeps
+                // its original indentation on purpose -- re-indenting ~900
+                // lines would bury this fix in whitespace.
+                bool semReleased = false;
+                try {
                 if (s_inDispatch) {
                     // Re-entered from a nested event loop (QML screenshot
                     // grab).  Skip execution and report a retryable error
@@ -936,6 +961,7 @@ void run_rpc_server(socket_t listen_fd,
                             rpcId, 2007,
                             QStringLiteral("Main thread busy in nested event loop; retry the request"));
                     }
+                    semReleased = true;
                     state->sem.release();
                     return;
                 }
@@ -1195,9 +1221,13 @@ void run_rpc_server(socket_t listen_fd,
                     QObject* obj = validatedElement(elementMap.get(), elementId, result);
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found: id=%1")
-                                .arg(elementId);
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found: id=%1")
+                                    .arg(elementId);
                     } else {
                         const QVariant val =
                             obj->property(
@@ -1221,8 +1251,12 @@ void run_rpc_server(socket_t listen_fd,
                     QObject* obj = validatedElement(elementMap.get(), elementId, result);
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found");
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found");
                     } else {
                         bool ok = obj->setProperty(
                             propName.toUtf8().constData(),
@@ -1244,8 +1278,12 @@ void run_rpc_server(socket_t listen_fd,
                     QObject* obj = validatedElement(elementMap.get(), elementId, result);
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found");
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found");
                     } else {
                         QVariantList varArgs;
                         for (const QJsonValue& v : args)
@@ -1267,8 +1305,12 @@ void run_rpc_server(socket_t listen_fd,
                     QObject* obj = validatedElement(elementMap.get(), elementId, result);
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found");
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found");
                     } else {
                         QWidget* w = qobject_cast<QWidget*>(obj);
                         if (w) {
@@ -1304,9 +1346,13 @@ void run_rpc_server(socket_t listen_fd,
                     QObject* obj = validatedElement(elementMap.get(), elementId, result);
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found: id=%1")
-                                .arg(elementId);
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found: id=%1")
+                                    .arg(elementId);
                     } else {
                         const QString button =
                             rpcParams[QStringLiteral("button")].toString(
@@ -1353,10 +1399,14 @@ void run_rpc_server(socket_t listen_fd,
                         QObject* winObj = validatedElement(elementMap.get(), windowId, result);
                         if (!winObj) {
                             result[QStringLiteral("ok")] = false;
-                            result[QStringLiteral("message")] =
-                                QStringLiteral(
-                                    "Window element not found: id=%1")
-                                    .arg(windowId);
+                            // validatedElement already recorded the precise
+                            // rejection reason (hidden / disabled / zero
+                            // size); a generic "not found" would hide it.
+                            if (!result.contains(QStringLiteral("message")))
+                                result[QStringLiteral("message")] =
+                                    QStringLiteral(
+                                        "Window element not found: id=%1")
+                                        .arg(windowId);
                         } else {
                             win = EventInjector::resolveWindow(winObj);
                         }
@@ -1378,9 +1428,13 @@ void run_rpc_server(socket_t listen_fd,
                     QObject* obj = validatedElement(elementMap.get(), elementId, result);
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found: id=%1")
-                                .arg(elementId);
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found: id=%1")
+                                    .arg(elementId);
                     } else {
                         const QString button =
                             rpcParams[QStringLiteral("button")].toString(
@@ -1405,9 +1459,13 @@ void run_rpc_server(socket_t listen_fd,
                     QObject* obj = validatedElement(elementMap.get(), elementId, result);
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found: id=%1")
-                                .arg(elementId);
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found: id=%1")
+                                    .arg(elementId);
                     } else {
                         const QString button =
                             rpcParams[QStringLiteral("button")].toString(
@@ -1437,9 +1495,13 @@ void run_rpc_server(socket_t listen_fd,
                     QObject* obj = validatedElement(elementMap.get(), elementId, result);
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found: id=%1")
-                                .arg(elementId);
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found: id=%1")
+                                    .arg(elementId);
                     } else {
                         const QString button =
                             rpcParams[QStringLiteral("button")].toString(
@@ -1469,9 +1531,13 @@ void run_rpc_server(socket_t listen_fd,
                     QObject* obj = validatedElement(elementMap.get(), elementId, result);
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found: id=%1")
-                                .arg(elementId);
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found: id=%1")
+                                    .arg(elementId);
                     } else {
                         const QString button =
                             rpcParams[QStringLiteral("button")].toString(
@@ -1501,9 +1567,13 @@ void run_rpc_server(socket_t listen_fd,
                     QObject* obj = validatedElement(elementMap.get(), elementId, result);
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found: id=%1")
-                                .arg(elementId);
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found: id=%1")
+                                    .arg(elementId);
                     } else {
                         double x = rpcParams[QStringLiteral("x")].toDouble(0.0);
                         double y = rpcParams[QStringLiteral("y")].toDouble(0.0);
@@ -1521,9 +1591,13 @@ void run_rpc_server(socket_t listen_fd,
                     QObject* obj = validatedElement(elementMap.get(), elementId, result);
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found: id=%1")
-                                .arg(elementId);
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found: id=%1")
+                                    .arg(elementId);
                     } else {
                         const double dx =
                             rpcParams[QStringLiteral("dx")].toDouble(0.0);
@@ -1679,9 +1753,13 @@ void run_rpc_server(socket_t listen_fd,
                     QObject* obj = validatedElement(elementMap.get(), elementId, result);
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found: id=%1")
-                                .arg(elementId);
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found: id=%1")
+                                    .arg(elementId);
                     } else {
                         const double x =
                             rpcParams[QStringLiteral("x")].toDouble(0.0);
@@ -1706,9 +1784,13 @@ void run_rpc_server(socket_t listen_fd,
                     QObject* obj = validatedElement(elementMap.get(), elementId, result);
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found: id=%1")
-                                .arg(elementId);
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found: id=%1")
+                                    .arg(elementId);
                     } else {
                         const double x =
                             rpcParams[QStringLiteral("x")].toDouble(0.0);
@@ -1780,9 +1862,13 @@ void run_rpc_server(socket_t listen_fd,
                     }
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found: id=%1")
-                                .arg(elementId);
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found: id=%1")
+                                    .arg(elementId);
                     } else {
                         const QString dir =
                             rpcParams[QStringLiteral("dir")].toString();
@@ -1812,9 +1898,13 @@ void run_rpc_server(socket_t listen_fd,
                     QObject* obj = validatedElement(elementMap.get(), elementId, result);
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
-                        result[QStringLiteral("message")] =
-                            QStringLiteral("Element not found: id=%1")
-                                .arg(elementId);
+                        // validatedElement already recorded the precise
+                        // rejection reason (hidden / disabled / zero size); a
+                        // generic "not found" here would hide the real cause.
+                        if (!result.contains(QStringLiteral("message")))
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found: id=%1")
+                                    .arg(elementId);
                     } else {
                         double x = rpcParams[QStringLiteral("x")].toDouble(-1.0);
                         double y = rpcParams[QStringLiteral("y")].toDouble(-1.0);
@@ -1840,6 +1930,7 @@ void run_rpc_server(socket_t listen_fd,
                             QStringLiteral("Method not found: ") +
                                 opMethod);
                     }
+                    semReleased = true;
                     state->sem.release();
                     return;
                 }
@@ -1848,7 +1939,35 @@ void run_rpc_server(socket_t listen_fd,
 
                 if (!isNotification)
                     state->response = jsonRpcResponse(rpcId, result);
+                semReleased = true;
                 state->sem.release();
+                } catch (const std::exception& e) {
+                    // The operation threw; answer an internal error so the
+                    // client fails fast instead of waiting out its timeout.
+                    if (!semReleased) {
+                        if (!isNotification) {
+                            state->response = jsonRpcError(
+                                rpcId, -32603,
+                                QStringLiteral("Internal error in %1: %2")
+                                    .arg(opMethod)
+                                    .arg(QString::fromUtf8(e.what())));
+                        }
+                        semReleased = true;
+                        state->sem.release();
+                    }
+                } catch (...) {
+                    if (!semReleased) {
+                        if (!isNotification) {
+                            state->response = jsonRpcError(
+                                rpcId, -32603,
+                                QStringLiteral("Internal error in %1: "
+                                               "unknown exception")
+                                    .arg(opMethod));
+                        }
+                        semReleased = true;
+                        state->sem.release();
+                    }
+                }
             },
             Qt::QueuedConnection);
 
@@ -1865,9 +1984,19 @@ void run_rpc_server(socket_t listen_fd,
                                "still queued and may execute; do not retry "
                                "side-effect operations without verifying state"));
         } else if (!state->response.isEmpty()) {
-            rpc_io::sendFrame(client_fd,
+            // frame_encode rejects payloads over the 16 MB cap and sendFrame
+            // reports that as false without sending anything -- ignoring it
+            // leaves the caller waiting for an answer until its own timeout.
+            // Return an explicit error so it can shrink the request instead.
+            if (!rpc_io::sendFrame(client_fd,
                       std::string(state->response.constData(),
-                                  state->response.size()));
+                                  state->response.size()))) {
+                rpc_io::sendJsonError(
+                    client_fd, rpcId < 0 ? 0 : rpcId, 2008,
+                    QStringLiteral("Response too large to frame (16 MB limit); "
+                                   "retry with a smaller maxDepth or a cheaper "
+                                   "detail tier"));
+            }
         }
         // Notifications: no response sent
     }

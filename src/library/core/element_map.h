@@ -44,6 +44,9 @@ public:
     void clear();
 
     /// Insert or overwrite a mapping.  Acquires a write lock internally.
+    /// Advances next_id_ past *id*, so a later insertIfAbsent() can never
+    /// re-issue an id that is already mapped; overwriting an id with a
+    /// different object also drops the displaced object's reverse entry.
     /// @param id   Numeric element identifier.
     /// @param obj  Live QObject* (tracked via QPointer; nulls out on death).
     void insert(uint64_t id, QObject* obj);
@@ -51,6 +54,9 @@ public:
     /// Grow-only insert: if *obj* is already mapped, return its existing
     /// id; otherwise allocate the next id and map it.  Never invalidates
     /// or renumbers existing ids -- the map only grows until clear().
+    /// The allocated id is always greater than every id ever stored
+    /// (insert() advances the counter too), so it cannot collide with an
+    /// id the caller already holds.
     /// Returns 0 for a null object.  Acquires a write lock internally
     /// (recursive: safe to call under an outer write lock).
     uint64_t insertIfAbsent(QObject* obj);

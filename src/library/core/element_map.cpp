@@ -40,8 +40,31 @@ void ElementMap::insert(uint64_t id, QObject* obj)
     // either never delivered (cross-thread queued connection) or re-entered
     // the map lock from ~QObject (direct-connection deadlock).
     const QPointer<QObject> ptr(obj);
+
+    // Overwriting an id with a DIFFERENT object must drop the displaced
+    // object's reverse entry.  Otherwise revMap_ keeps two objects pointing
+    // at the same id: idFor(displaced) still reports the id, and the next
+    // insertIfAbsent(displaced) would hand that id straight back even though
+    // the map now resolves it to somebody else.  Only remove it when the
+    // reverse entry really points at *this* id -- the same object may
+    // legitimately be mapped under several ids.
+    const QPointer<QObject> previous = map_.value(id);
+    if (!previous.isNull() && previous != ptr) {
+        const auto revIt = revMap_.constFind(previous);
+        if (revIt != revMap_.constEnd() && revIt.value() == id)
+            revMap_.remove(previous);
+    }
+
     map_.insert(id, ptr);
     revMap_.insert(ptr, id);
+
+    // Keep next_id_ strictly above every id ever stored here.  The snapshot
+    // handler assigns ids 1..N from its own local counter, so without this
+    // next_id_ is still 1 afterwards and the next grow-only insertIfAbsent
+    // re-issues id 1: map_.insert() then silently replaces the object that
+    // owned it while revMap_ keeps both objects pointing at id 1.
+    if (id >= next_id_)
+        next_id_ = id + 1;
 }
 
 QObject* ElementMap::lookup(uint64_t id) const

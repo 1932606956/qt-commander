@@ -45,6 +45,22 @@ static_assert(sizeof(InitParams) == INIT_PARAMS_TOTAL_SIZE,
 // ---------------------------------------------------------------------------
 extern "C" int qt_commander_init(const InitParams* params);
 
+// ---------------------------------------------------------------------------
+// Session control entry points
+//
+// qt_commander_request_shutdown() asks the active session to stop: it only
+// sets the flag the RPC thread polls, so it is safe to call from any thread
+// and allocates nothing.  Returns 0 unconditionally.
+//
+// qt_commander_session_state() returns 1 while a session is active (the RPC
+// thread claimed the slot and has not released it yet), 0 when idle.  The
+// injector's eject path polls this before deciding whether the module can be
+// unloaded: unloading while the RPC thread is still running would leave that
+// thread to resume into unmapped memory.
+// ---------------------------------------------------------------------------
+extern "C" int qt_commander_request_shutdown(void);
+extern "C" int qt_commander_session_state(void);
+
 namespace qt_commander {
 
 // ---------------------------------------------------------------------------

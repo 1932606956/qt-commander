@@ -812,20 +812,21 @@ void run_rpc_server(socket_t listen_fd,
     // so the loop can honour the flag between attempts.  The timeout is set
     // on the LISTENER only -- the accepted socket gets its own timeouts
     // further down.
+    // Persistent service: one init serves many connections.  A client
+    // that merely disconnects returns us to the bounded accept below;
+    // only qt.shutdown ends the service.  The body is deliberately NOT
+    // re-indented (thousand-line patch surface).  The 250 ms listener
+    // timeout lets the accept loop honour the flag between attempts.
     tcp_set_recv_timeout(listen_fd, 250);
+    for (;;) {
     socket_t client_fd = INVALID_SOCK;
     while (!shutdown_flag.load()) {
         client_fd = tcp_accept(listen_fd);
         if (client_fd != INVALID_SOCK)
             break;  // connected; a timeout just re-checks the flag
     }
-    tcp_close(listen_fd);                 // no longer needed
     if (client_fd == INVALID_SOCK)
-        return;  // shutdown requested -- give up and release the slot
-    if (shutdown_flag.load()) {
-        tcp_close(client_fd);
-        return;
-    }
+        break;  // shutdown requested -- terminate the service
 
     // Set keepalive (2h idle, 1s interval, 3 probes)
     tcp_set_keepalive(client_fd, 7200, 1, 3);
@@ -838,8 +839,10 @@ void run_rpc_server(socket_t listen_fd,
 
     const std::string authPayload = rpc_io::readFrame(client_fd);
     if (authPayload.empty()) {
+        // Liveness probes connect and close without authenticating;
+        // that must not kill the persistent service.
         tcp_close(client_fd);
-        return;
+        continue;  // back to accept
     }
 
     // Restore blocking mode for subsequent operations
@@ -851,7 +854,7 @@ void run_rpc_server(socket_t listen_fd,
         QByteArray::fromStdString(authPayload), &parseErr);
     if (parseErr.error != QJsonParseError::NoError || !authDoc.isObject()) {
         tcp_close(client_fd);
-        return;
+        continue;  // back to accept
     }
 
     QJsonObject authReq = authDoc.object();
@@ -864,7 +867,7 @@ void run_rpc_server(socket_t listen_fd,
             QStringLiteral("Expected qt.authenticate"));
         rpc_io::sendFrame(client_fd, std::string(err.constData(), err.size()));
         tcp_close(client_fd);
-        return;
+        continue;  // back to accept
     }
 
     // Verify token
@@ -880,7 +883,7 @@ void run_rpc_server(socket_t listen_fd,
         rpc_io::sendJsonError(client_fd, authId, 2009,
                       QStringLiteral("Authentication failed: invalid token"));
         tcp_close(client_fd);
-        return;
+        continue;  // back to accept (the token still gates access)
     }
 
     // Auth success
@@ -916,8 +919,11 @@ void run_rpc_server(socket_t listen_fd,
         const bool isNotification = (rpcId < 0);
 
         // Route shutdown
-        if (rpcMethod == QStringLiteral("qt.shutdown"))
+        if (rpcMethod == QStringLiteral("qt.shutdown")) {
+            // Terminate the whole service, not just this connection.
+            shutdown_flag.store(true);
             break; // no response
+        }
 
         // Build shared state for main-thread dispatch
         struct SharedState {
@@ -2002,6 +2008,15 @@ void run_rpc_server(socket_t listen_fd,
     }
 
     tcp_close(client_fd);
+    }                                     // for (;;) -- back to accept
+    tcp_close(listen_fd);
+#ifdef _WIN32
+    if (!port_file_path.empty())
+        ::_unlink(port_file_path.c_str());   // no stale handshake file
+#else
+    if (!port_file_path.empty())
+        ::unlink(port_file_path.c_str());
+#endif
 }
 
 } // namespace qt_commander

@@ -34,8 +34,10 @@
 // ---------------------------------------------------------------------------
 namespace {
 
+#ifndef QT_COMMANDER_NO_DLLMAIN
 /// Set to `true` once DllMain(DLL_PROCESS_ATTACH) runs.
 std::atomic<bool> g_library_loaded{false};
+#endif
 
 /// Guards the session slot.  Held briefly by qt_commander_init to claim the
 /// slot and by the RPC server thread on exit to release it, so a new
@@ -79,6 +81,7 @@ void run_rpc_server(socket_t listen_fd,
 // ---------------------------------------------------------------------------
 // DllMain
 // ---------------------------------------------------------------------------
+#ifndef QT_COMMANDER_NO_DLLMAIN
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
     (void)hinstDLL;
@@ -95,6 +98,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 
     return TRUE;
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // qt_commander_init  --  called by the injector after LoadLibrary

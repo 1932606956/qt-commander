@@ -32,6 +32,38 @@ add_library(qt-commander-lib SHARED ${LIB_SOURCES}
     rpc/rpc_server.h
 )
 
+# Optional static variant for in-process embedding (host harness, future
+# plugins).  Mirrors the SHARED target's sources/includes/links; defines
+# QT_COMMANDER_NO_DLLMAIN so it can link into a DLL owning its DllMain.
+if(QTC_STATIC)
+    add_library(qt-commander-static STATIC ${LIB_SOURCES})
+    set_target_properties(qt-commander-static PROPERTIES
+        OUTPUT_NAME "qt-commander-static"
+    )
+    target_compile_definitions(qt-commander-static PUBLIC QT_COMMANDER_NO_DLLMAIN)
+    target_include_directories(qt-commander-static PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ..
+        ${Qt${QT_MAJOR_VERSION}Gui_PRIVATE_INCLUDE_DIRS}
+    )
+    target_link_libraries(qt-commander-static PUBLIC
+        Qt${QT_MAJOR_VERSION}::Core
+        Qt${QT_MAJOR_VERSION}::Gui
+        Qt${QT_MAJOR_VERSION}::Widgets
+    )
+    if(WITH_QML)
+        target_compile_definitions(qt-commander-static PUBLIC QT_COMMANDER_WITH_QML)
+        target_link_libraries(qt-commander-static PUBLIC Qt${QT_MAJOR_VERSION}::Quick)
+        if(QT_MAJOR_VERSION EQUAL 6)
+            target_link_libraries(qt-commander-static PUBLIC Qt6::Qml)
+        endif()
+    endif()
+    if(WIN32)
+        target_sources(qt-commander-static PRIVATE entry_win.cpp)
+        target_link_libraries(qt-commander-static PUBLIC ws2_32)
+    endif()
+endif()
+
 target_include_directories(qt-commander-lib PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ..

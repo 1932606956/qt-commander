@@ -56,7 +56,13 @@ QString Screenshot::capture(QObject* target,
         // Only bail when the widget has no window at all: there is nothing
         // to render then.
         QWidget* grabTarget = w;
-        if (!w->paintEngine()) {
+        // paintEngine() is null for every non-native child widget on
+        // Qt 5 (the backing store belongs to the top-level): falling
+        // back to w->window() here silently turned every child-element
+        // screenshot into a full-window grab.  Keep the bail-out only
+        // for top-level windows, where a null paintEngine really means
+        // "first frame not drawn yet"; children are safe to grab().
+        if (!w->paintEngine() && w->isWindow()) {
             QWidget* win = w->window();
             if (!win)
                 return {};

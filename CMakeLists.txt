@@ -33,6 +33,8 @@ option(BUILD_INJECTOR   "Build qt-injector standalone CLI"  ON)
 option(BUILD_INJECTOR   "Build qt-injector standalone CLI"  ON)
 option(BUILD_LIBRARY  "Build injection library"        OFF)
 option(BUILD_TESTS    "Build tests"                    ON)
+option(QTC_STATIC     "Also build a static library (qt-commander-static) for in-process embedding" OFF)
+option(QTC_BUILD_HOST "Build the in-process host harness (qtc-host)" OFF)
 option(WITH_QML       "Build with QML/QQuick support"  ON)
 set(QT_MAJOR_VERSION "5" CACHE STRING "Qt major version (5 or 6)")
 
@@ -78,6 +80,10 @@ endif()
 
 if(BUILD_LIBRARY)
     add_subdirectory(src/library)
+endif()
+
+if(QTC_BUILD_HOST AND BUILD_LIBRARY)
+    add_subdirectory(tools/qtc_host)
 endif()
 
 if(BUILD_TESTS)

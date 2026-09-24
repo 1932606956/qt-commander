@@ -8,12 +8,10 @@
 // called by entry_win.cpp / entry_unix.cpp.
 namespace qt_commander {
 
-/// Run the JSON-RPC server loop on the calling (worker) thread until the
-/// client disconnects or sends qt.shutdown.  On success (auth passed and
-/// a session ran), returns 0.
-int run_rpc_server(socket_t listen_fd,
-                   std::string port_file_path,
-                   const std::string& token,
-                   const InitParams* params);
+// run_rpc_server is defined in rpc_server.cpp with a five-parameter
+// signature (listen_fd, port_file_path, session_id, token, shutdown_flag)
+// and forward-declared by the entry_*.cpp files themselves.  The stale
+// four-parameter declaration that used to live here never matched the
+// definition and has been removed.
 
 } // namespace qt_commander

@@ -187,6 +187,22 @@ QVector<QObject*> collectRoots(
     }
 
     // 3. No ancestor / no window -- walk all top-level windows.
+    //
+    // Widget side first: QApplication::topLevelWidgets() also lists hidden
+    // and never-realized top-level widgets (a closed ADS dock is exactly
+    // that), and needs no winId() at all.  The QWindow walk below cannot
+    // reach them: QWidget::find(win->winId()) would force-create the
+    // platform window of an unrealized window, which is fatal for
+    // QQuickWidget's internal "Offscreen" QQuickWindow (see the guard).
+    const QWidgetList toplevelWidgets = QApplication::topLevelWidgets();
+    QSet<QObject*> seen;
+    seen.reserve(toplevelWidgets.size() + 8);
+    for (QWidget* w : toplevelWidgets) {
+        if (!w || seen.contains(w))
+            continue;
+        seen.insert(w);
+        roots.append(w);
+    }
     const QList<QWindow*> toplevels = QGuiApplication::topLevelWindows();
     for (QWindow* win : toplevels) {
         // A window without a platform window has never been realized.
@@ -201,7 +217,10 @@ QVector<QObject*> collectRoots(
             continue;
         // Widget-backed window
         if (QWidget* w = QWidget::find(win->winId())) {
-            roots.append(w);
+            if (!seen.contains(w)) {
+                seen.insert(w);
+                roots.append(w);
+            }
         }
 #ifdef QT_COMMANDER_WITH_QML
         // QQuickWindow

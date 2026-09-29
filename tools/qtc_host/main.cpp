@@ -16,12 +16,14 @@
 #include <QCheckBox>
 #include <QCommandLineOption>
 #include <QCommandLineParser>
+#include <QDockWidget>
 #include <QFile>
 #include <QLabel>
 #include <QLibrary>
 #include <QLineEdit>
 #include <QMainWindow>
 #include <QPushButton>
+#include <QTabWidget>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -62,7 +64,7 @@ QMainWindow* buildWindow()
     auto* win = new QMainWindow;
     win->setObjectName("host_mainwindow");
     win->setWindowTitle("qtc-host");
-    win->resize(640, 420);
+    win->resize(640, 480);
 
     auto* central = new QWidget(win);
     central->setObjectName("host_central");
@@ -85,8 +87,61 @@ QMainWindow* buildWindow()
     check->setObjectName("host_check");
     layout->addWidget(check);
 
+    // -- quickShot verification rig ------------------------------------
+    // Hidden tab page: page two is not current, so host_tab2_target is
+    // invisible until quickShot switches the tab (how="tab").
+    auto* tabs = new QTabWidget(central);
+    tabs->setObjectName("host_tabs");
+    auto* page1 = new QWidget(tabs);
+    page1->setObjectName("host_tab1");
+    page1->setLayout(new QVBoxLayout(page1));
+    auto* page2 = new QWidget(tabs);
+    page2->setObjectName("host_tab2");
+    auto* page2Lay = new QVBoxLayout(page2);
+    auto* tab2Target = new QLabel("tab two target", page2);
+    tab2Target->setObjectName("host_tab2_target");
+    page2Lay->addWidget(tab2Target);
+    tabs->addTab(page1, "one");
+    tabs->addTab(page2, "two");
+    tabs->setCurrentIndex(0);
+    layout->addWidget(tabs);
+
+    // Hidden dock: closed right after being docked; its body is reachable
+    // only after a reveal (QDockWidget path -> how="dock-action").
+    auto* dock = new QDockWidget("host dock", win);
+    dock->setObjectName("host_dock");
+    auto* dockBody = new QWidget(dock);
+    dockBody->setObjectName("host_dock_body");
+    auto* dockLay = new QVBoxLayout(dockBody);
+    auto* dockTarget = new QLabel("dock target", dockBody);
+    dockTarget->setObjectName("host_dock_target");
+    dockLay->addWidget(dockTarget);
+    dock->setWidget(dockBody);
+    win->addDockWidget(Qt::RightDockWidgetArea, dock);
+    dock->hide();
+
     layout->addStretch(1);
     win->setCentralWidget(central);
+
+    // Never-shown top-level window: how="window-show" path.  Deliberately
+    // unparented: a parented QWidget is a child widget, not a window, and
+    // the window-show scenario would stop exercising that branch.
+    auto* hiddenWin = new QWidget;
+    hiddenWin->setObjectName("host_hiddenwin");
+    hiddenWin->setWindowTitle("host hidden window");
+    hiddenWin->resize(240, 120);
+    auto* hwLay = new QVBoxLayout(hiddenWin);
+    auto* hwTarget = new QLabel("hidden window target", hiddenWin);
+    hwTarget->setObjectName("host_hiddenwin_target");
+    hwLay->addWidget(hwTarget);
+    // Give the never-shown window a native handle WITHOUT showing it: the
+    // scanner's collectRoots() skips handle-less windows (the winId() crash
+    // guard), so without this the target would be undiscoverable by find.
+    // A created-but-hidden handle is exactly the state a shown-then-hidden
+    // window is in, which is the realistic scenario under test.  Safe for
+    // a plain QWidget (the guard exists for QQuickWidget offscreen windows).
+    hiddenWin->winId();
+
     return win;
 }
 

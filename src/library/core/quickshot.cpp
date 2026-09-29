@@ -108,9 +108,13 @@ void QuickShot::collectBlockers(const QVector<QObject*>& chain,
                                 QVector<RevealStep>* blockers,
                                 QJsonArray* unhandled)
 {
-    for (int i = chain.size() - 1; i >= 1; --i) {
+    // i >= 0: the TARGET ITSELF counts too.  A hidden top-level widget
+    // (a closed ads::CDockWidget is one) has no ancestor on the chain that
+    // blocks it -- it IS the blocker; skipping i == 0 left such targets
+    // with an empty reveal ledger and "not capturable after reveal".
+    for (int i = chain.size() - 1; i >= 0; --i) {
         QObject* node = chain.at(i);
-        QObject* child = chain.at(i - 1);   // next node towards the target
+        QObject* child = (i > 0) ? chain.at(i - 1) : nullptr;
 
         RevealStep step;
         step.node = node;

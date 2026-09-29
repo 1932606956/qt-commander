@@ -24,6 +24,7 @@ set(LIB_SOURCES
     core/event_injector.cpp
     core/element_map.cpp
     core/screenshot.cpp
+    core/quickshot.cpp
     selector/selector.cpp
     ../common/socket_utils.cpp
 )

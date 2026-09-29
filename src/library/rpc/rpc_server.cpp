@@ -13,6 +13,7 @@
 #include "selector/selector.h"
 #include "../core/event_injector.h"
 #include "../core/screenshot.h"
+#include "../core/quickshot.h"
 #include "../core/ui_scanner.h"
 #ifdef QT_COMMANDER_WITH_QML
 #include <QQuickWindow>
@@ -240,6 +241,41 @@ QObject* validatedElement(ElementMap* elementMap, uint64_t elementId,
     }
 #endif
     return obj;
+}
+
+// ---------------------------------------------------------------------------
+// fallbackTopLevelTarget — "element_id == 0 and no query": the active (or
+// first visible) top-level widget, mirroring the qt.screenshot default.
+// ---------------------------------------------------------------------------
+QObject* fallbackTopLevelTarget()
+{
+    if (auto* app =
+            qobject_cast<QApplication*>(QCoreApplication::instance())) {
+        QWidget* top = app->activeWindow();
+        if (!top || !top->isVisible()) {
+            const auto widgets = app->topLevelWidgets();
+            for (QWidget* w : widgets) {
+                if (w->isVisible()) {
+                    top = w;
+                    break;
+                }
+            }
+        }
+        if (top)
+            return top;
+    }
+#ifdef QT_COMMANDER_WITH_QML
+    // QML apps have no QWidgets; fall back to the first visible
+    // QQuickWindow.
+    const auto wins = QGuiApplication::topLevelWindows();
+    for (QWindow* win : wins) {
+        if (auto* qw = qobject_cast<QQuickWindow*>(win)) {
+            if (qw->isVisible())
+                return qw;
+        }
+    }
+#endif
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -1835,36 +1871,7 @@ void run_rpc_server(socket_t listen_fd,
                         // element_id == 0 means "entire window": fall back to
                         // the active (or first visible) top-level widget,
                         // mirroring the snapshot rootId==0 path.
-                        if (auto* app =
-                                qobject_cast<QApplication*>(QCoreApplication::instance())) {
-                            QWidget* top = app->activeWindow();
-                            if (!top || !top->isVisible()) {
-                                const auto widgets = app->topLevelWidgets();
-                                for (QWidget* w : widgets) {
-                                    if (w->isVisible()) {
-                                        top = w;
-                                        break;
-                                    }
-                                }
-                            }
-                            obj = top;
-                        }
-#ifdef QT_COMMANDER_WITH_QML
-                        // QML apps have no QWidgets; fall back to the first
-                        // visible QQuickWindow.
-                        if (!obj) {
-                            const auto wins =
-                                QGuiApplication::topLevelWindows();
-                            for (QWindow* win : wins) {
-                                if (auto* qw = qobject_cast<QQuickWindow*>(win)) {
-                                    if (qw->isVisible()) {
-                                        obj = qw;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-#endif
+                        obj = fallbackTopLevelTarget();
                     }
                     if (!obj) {
                         result[QStringLiteral("ok")] = false;
@@ -1897,6 +1904,100 @@ void run_rpc_server(socket_t listen_fd,
                             result[QStringLiteral("path")] = filePath;
                             result[QStringLiteral("seq")] = seq;
                         }
+                    }
+                }
+                // ---- quickShot ----
+                else if (opMethod == QStringLiteral("quickShot")) {
+                    const bool reveal =
+                        rpcParams[QStringLiteral("reveal")].toBool(true);
+                    const bool doRestore =
+                        rpcParams[QStringLiteral("restore")].toBool(false);
+                    const int timeoutMs =
+                        rpcParams[QStringLiteral("timeout_ms")].toInt(2000);
+                    const QString dir =
+                        rpcParams[QStringLiteral("dir")].toString();
+                    const int seq =
+                        rpcParams[QStringLiteral("seq")].toInt(0);
+
+                    QObject* obj = nullptr;
+                    int matchCount = 1;
+                    if (elementId > 0) {
+                        obj = elementMap->get(elementId);
+                        if (!obj) {
+                            result[QStringLiteral("ok")] = false;
+                            result[QStringLiteral("message")] =
+                                QStringLiteral("Element not found: id=%1")
+                                    .arg(elementId);
+                        }
+                    } else if (rpcParams.contains(
+                                   QStringLiteral("query"))) {
+                        // Same matcher and grow-only id assignment as
+                        // findElement: matched objects join the map without
+                        // renumbering anything the caller already holds.
+                        // Hidden targets are the whole point of quickShot,
+                        // so include_hidden defaults to true here (the
+                        // registry walk prunes hidden subtrees otherwise).
+                        QJsonObject query =
+                            rpcParams[QStringLiteral("query")].toObject();
+                        if (!query.contains(QStringLiteral("include_hidden")))
+                            query[QStringLiteral("include_hidden")] = true;
+                        auto results =
+                            ElementSelector::find(query,
+                                                  elementMap->snapshot());
+                        matchCount = int(results.size());
+                        if (results.isEmpty()) {
+                            result[QStringLiteral("ok")] = false;
+                            result[QStringLiteral("message")] =
+                                QStringLiteral(
+                                    "No matching element found");
+                        } else {
+                            locker.unlock();
+                            {
+                                QWriteLocker wlock(elementMap->rwLock());
+                                for (SelectorResult& r : results) {
+                                    if (r.id == 0)
+                                        r.id = elementMap->insertIfAbsent(
+                                            r.object);
+                                }
+                            }
+                            locker.relock();
+                            obj = results.first().object;
+                        }
+                    } else {
+                        obj = fallbackTopLevelTarget();
+                        if (!obj) {
+                            result[QStringLiteral("ok")] = false;
+                            result[QStringLiteral("message")] =
+                                QStringLiteral(
+                                    "No visible top-level window");
+                        }
+                    }
+
+                    if (obj) {
+                        // QuickShot::run spins the event loop while waiting
+                        // for the reveal to land (same discipline as the
+                        // QML grab): release the read lock around it.
+                        locker.unlock();
+                        const QuickShotOutcome outcome =
+                            QuickShot::run(obj, dir, seq, reveal, doRestore,
+                                           timeoutMs);
+                        locker.relock();
+                        result[QStringLiteral("ok")] = outcome.ok;
+                        if (!outcome.message.isEmpty())
+                            result[QStringLiteral("message")] =
+                                outcome.message;
+                        if (!outcome.path.isEmpty())
+                            result[QStringLiteral("path")] = outcome.path;
+                        result[QStringLiteral("seq")] = seq;
+                        result[QStringLiteral("match_count")] = matchCount;
+                        QJsonArray rev;
+                        for (const RevealStep& s : outcome.revealed)
+                            rev.append(QuickShot::stepToJson(s));
+                        result[QStringLiteral("revealed")] = rev;
+                        result[QStringLiteral("restored")] =
+                            outcome.restored;
+                        result[QStringLiteral("unhandled")] =
+                            outcome.unhandled;
                     }
                 }
                 // ---- contextMenu ----

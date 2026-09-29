@@ -124,21 +124,51 @@ void QuickShot::collectBlockers(const QVector<QObject*>& chain,
             continue;
         }
         if (auto* tabs = qobject_cast<QTabWidget*>(node)) {
-            if (tabs->currentWidget() != child) {
+            // QTabWidget's immediate visual child is its PRIVATE
+            // QStackedWidget, not the page -- resolve the page through the
+            // chain via indexOf() (>= 0 only for real tab pages).
+            QWidget* page = nullptr;
+            for (int j = 0; j < i; ++j) {
+                auto* x = qobject_cast<QWidget*>(chain.at(j));
+                if (x && tabs->indexOf(x) >= 0) {
+                    page = x;
+                    break;
+                }
+            }
+            if (page && tabs->currentWidget() != page) {
+                step.child = page;
                 step.how = QStringLiteral("tab");
                 blockers->append(step);
             }
             continue;
         }
         if (auto* stack = qobject_cast<QStackedWidget*>(node)) {
-            if (stack->currentWidget() != child) {
+            QWidget* page = nullptr;
+            for (int j = 0; j < i; ++j) {
+                auto* x = qobject_cast<QWidget*>(chain.at(j));
+                if (x && stack->indexOf(x) >= 0) {
+                    page = x;
+                    break;
+                }
+            }
+            if (page && stack->currentWidget() != page) {
+                step.child = page;
                 step.how = QStringLiteral("stack");
                 blockers->append(step);
             }
             continue;
         }
         if (auto* box = qobject_cast<QToolBox*>(node)) {
-            if (box->currentWidget() != child) {
+            QWidget* page = nullptr;
+            for (int j = 0; j < i; ++j) {
+                auto* x = qobject_cast<QWidget*>(chain.at(j));
+                if (x && box->indexOf(x) >= 0) {
+                    page = x;
+                    break;
+                }
+            }
+            if (page && box->currentWidget() != page) {
+                step.child = page;
                 step.how = QStringLiteral("toolbox");
                 blockers->append(step);
             }
